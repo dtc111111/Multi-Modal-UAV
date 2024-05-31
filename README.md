@@ -5,7 +5,7 @@
 
   <h1 align="center">Multi-Modal UAV Detection, Classification, and Tracking Algorithm</h1>
   <h3 align="center">CVPR 2024 UG2 Challenge Champion</h3>
-  <h3 align="center"><a href="[https://arxiv.org/pdf/2312.02126.pdf](https://arxiv.org/pdf/2405.16464)">Paper</a> </h3>
+  <h3 align="center"><a href="https://arxiv.org/pdf/2405.16464">Paper</a> </h3>
   <div align="center"></div>
 </p>
 
