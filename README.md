@@ -45,7 +45,7 @@
 </details>
 ## Installation
 
-##### (Recommended)
+##### (Recommended Environment)
 Our method has been tested on python 3.10, CUDA>=11.6. The simplest way to install all dependences is to use [anaconda](https://www.anaconda.com/) and [pip](https://pypi.org/project/pip/) in the following steps: 
 
 ```bash
