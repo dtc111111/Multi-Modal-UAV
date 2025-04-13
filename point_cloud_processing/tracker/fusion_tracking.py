@@ -1,4 +1,5 @@
 import os
+import argparse
 import numpy as np
 from datetime import datetime, timedelta
 from stonesoup.models.transition.linear import ConstantVelocity, CombinedLinearGaussianTransitionModel
@@ -20,187 +21,240 @@ from stonesoup.deleter.error import CovarianceBasedDeleter
 
 from stonesoup.initiator.simple import MultiMeasurementInitiator
 
-
-
 from matplotlib import pyplot as plt
 
 from sklearn.cluster import DBSCAN
 
 from dataset_loader import extract_timestamp, read_lidar_files
 
-dataset_folder = "/media/yi/KESU/anti_uav/reorg_data"
-figure_folder = "/media/yi/KESU/anti_uav/figure/png/tracking_plot_with_gt"
+import os
+import numpy as np
+from matplotlib import pyplot as plt
+import torch
+import torch.nn as nn
+from sklearn.cluster import DBSCAN
+from typing import Dict, List, Tuple
+
+# Assuming these are in your project
+from extract_feature import extract_feature_set_predict
+from dataset_loader import read_lidar_files
+from lidar_360_detector import MyLSTMClassifier
+
+import os
+import numpy as np
+from matplotlib import pyplot as plt
+from sklearn.cluster import DBSCAN
+from dataset_loader import extract_timestamp, read_lidar_files
 
 
-def point_cloud_detector(filtered_data):
-    db = DBSCAN(eps=1, min_samples=1).fit(filtered_data)
+def point_cloud_detector(filtered_data, eps=1, min_samples=1):
+    db = DBSCAN(eps=eps, min_samples=min_samples).fit(filtered_data)
     labels = db.labels_
-
-    # Number of clusters in labels, ignoring noise if present.
-    n_clusters_ = len(set(labels)) - (1 if -1 in labels else 0)
-    n_noise_ = list(labels).count(-1)
-
     unique_labels = set(labels)
-
     cluster_centers = []
+
     for k in unique_labels:
         if k == -1:
             continue
         class_mask = (labels == k)
         cluster_center = np.mean(filtered_data[class_mask], axis=0)
         cluster_centers.append(cluster_center)
-    cluster_centers = np.array(cluster_centers)
-    return cluster_centers
 
-for seq_folder in os.listdir(dataset_folder):
-    print("Processing "+seq_folder)
+    return np.array(cluster_centers)
 
-    seq_folder_path = os.path.join(dataset_folder, seq_folder)
 
-    # initial state
-    gt_directory = os.path.join(seq_folder_path, "gt")
-    gt_data = read_lidar_files(gt_directory)
+def process_sequence(seq_folder_path,
+                     result_folder_path,
+                     eps, min_samples,
+                     noise_covar,
+                     missed_distance,
+                     covar_trace_thresh,
+                     min_points):
+    print(f"Processing {os.path.basename(seq_folder_path)}")
 
-    lidar_directory = os.path.join(seq_folder_path, "lidar")
+
+    lidar_directory = os.path.join(seq_folder_path, "lidar_fusion")
     lidar_data = read_lidar_files(lidar_directory)
 
+    # Find start time
     for timestamp, data in lidar_data.items():
         if data.size != 0:
-            start_time = timestamp
             timestamp_float = float(timestamp)
             seconds = int(timestamp_float)
-            microseconds = int((timestamp_float - seconds)*1e6)
-            start_datatime_object = datetime.fromtimestamp(seconds) + timedelta(microseconds = microseconds)
+            microseconds = int((timestamp_float - seconds) * 1e6)
+            start_datetime = datetime.fromtimestamp(seconds) + timedelta(microseconds=microseconds)
             break
-        
-    prior = GaussianState([[data[0][0]], [0.001], [data[0][1]], [0.001], [data[0][2]], [0.001]], 
-                      np.diag([0.01, 0.1, 0.01, 0.1, 0.01, 0.1]), 
-                      timestamp=start_datatime_object)
-    
+
+    # Initialize prior state
+    if lidar_data:
+        initial_data = next(iter(lidar_data.values()))
+        if initial_data.size > 0:
+            prior = GaussianState(
+                [[initial_data[0][0]], [0.001], [initial_data[0][1]], [0.001], [initial_data[0][2]], [0.001]],
+                np.diag([0.01, 0.1, 0.01, 0.1, 0.01, 0.1]),
+                timestamp=start_datetime
+            )
+        else:
+            print(f"No initial data for {seq_folder_path}, skipping")
+            return
+    else:
+        print(f"No LiDAR data for {seq_folder_path}, skipping")
+        return
+
+    # Measurement model
     meas_model = LinearGaussian(
-        ndim_state=6,  # Number of state dimensions (position and velocity in 2D)
-        mapping=(0, 2, 4),  # Mapping measurement vector index to state index
-        noise_covar=np.array([[0.001, 0, 0],  # Covariance matrix for Gaussian PDF
-                          [0, 0.001, 0],
-                          [0, 0, 0.001]]))
-    
+        ndim_state=6,
+        mapping=(0, 2, 4),
+        noise_covar=np.array([
+            [noise_covar, 0, 0],
+            [0, noise_covar, 0],
+            [0, 0, noise_covar]
+        ])
+    )
+
+    # Create measurements
     all_measurements = []
     for timestamp, data in lidar_data.items():
         measurement_set = set()
-        filtered_data = data
-        if filtered_data.size != 0:
-            cluster_data = point_cloud_detector(filtered_data)
-            #if cluster_data.shape[0] > 1:
+        if data.size != 0:
+            cluster_data = point_cloud_detector(data, eps=eps, min_samples=min_samples)
             timestamp_float = float(timestamp)
             seconds = int(timestamp_float)
-            microseconds = int((timestamp_float - seconds)*1e6)
-            datetime_object = datetime.fromtimestamp(seconds) + timedelta(microseconds = microseconds)
+            microseconds = int((timestamp_float - seconds) * 1e6)
+            datetime_object = datetime.fromtimestamp(seconds) + timedelta(microseconds=microseconds)
+
             for detection in cluster_data:
-                measurement_set.add(Detection(detection.transpose(),
-                                  timestamp=datetime_object,
-                                  measurement_model=meas_model))
+                measurement_set.add(Detection(
+                    detection.transpose(),
+                    timestamp=datetime_object,
+                    measurement_model=meas_model
+                ))
             all_measurements.append(measurement_set)
 
-    transition_model = CombinedLinearGaussianTransitionModel(
-    [ConstantVelocity(0.15),
-     ConstantVelocity(0.15),
-     ConstantVelocity(0.15)])
+    # Transition model
+    transition_model = CombinedLinearGaussianTransitionModel([
+        ConstantVelocity(0.15),
+        ConstantVelocity(0.15),
+        ConstantVelocity(0.15)
+    ])
 
+    # Predictor and updater
     predictor = ExtendedKalmanPredictor(transition_model)
     updater = ExtendedKalmanUpdater(measurement_model=meas_model)
 
-
-    deleter = CovarianceBasedDeleter(covar_trace_thresh=30)
-
+    # Tracker components
+    deleter = CovarianceBasedDeleter(covar_trace_thresh=covar_trace_thresh)
     meas = Euclidean()
-    hypothesiser = DistanceHypothesiser(predictor, updater, meas, missed_distance=3)
+    hypothesiser = DistanceHypothesiser(predictor, updater, meas, missed_distance=missed_distance)
     data_associator = NearestNeighbour(hypothesiser)
 
-    #initiator = SimpleMeasurementInitiator(prior, meas_model)
-    initiator = MultiMeasurementInitiator(prior_state= prior,
-        measurement_model=meas_model, deleter=deleter, data_associator=data_associator, 
-                                      updater=updater,min_points=1)
+    initiator = MultiMeasurementInitiator(
+        prior_state=prior,
+        measurement_model=meas_model,
+        deleter=deleter,
+        data_associator=data_associator,
+        updater=updater,
+        min_points=min_points
+    )
 
+    # Tracking
     tracks = set()
     for i, measurements in enumerate(all_measurements):
-    # Calculate all hypothesis pairs and associate the elements in the best subset to the tracks.
-        for det in measurements:
-            timestamp = det.timestamp
-            break
-        hypotheses = data_associator.associate(tracks,
-                                           measurements,
-                                           timestamp)
+        if not measurements:
+            continue
+
+        timestamp = next(iter(measurements)).timestamp
+        hypotheses = data_associator.associate(tracks, measurements, timestamp)
         associated_measurements = set()
-        for track in tracks:
+
+        for track in tracks.copy():
             hypothesis = hypotheses[track]
             if hypothesis.measurement:
                 post = updater.update(hypothesis)
                 track.append(post)
                 associated_measurements.add(hypothesis.measurement)
-            else:  # When data associator says no detections are good enough, we'll keep the prediction
+            else:
                 track.append(hypothesis.prediction)
 
-        # Carry out deletion and initiation
+
+        # Deletion and initiation
         tracks -= deleter.delete_tracks(tracks)
         tracks |= initiator.initiate(measurements - associated_measurements, timestamp)
+
         #print(f"the number of detected points is {len(measurements)}, and there are {len(tracks)} tracks at frame {i}")
-
-    accumulated_gt = np.array([])
-
-    for timestamp, data in gt_data.items():
-        if np.size(accumulated_gt) ==0:
-            accumulated_gt = data
-        else:
-            accumulated_gt = np.concatenate((accumulated_gt, data), axis=0)
-    
-    accumulated_gt = np.array(accumulated_gt)
-
-    gt_x_list = []
-    gt_y_list = []
-    gt_z_list = []
-
-    for t, measurement in enumerate(all_measurements):
-    #print(measurement.state_vector)
-        for m in measurement:
-            x = m.state_vector[0]
-            y = m.state_vector[1]
-            z = m.state_vector[2]
-            gt_x_list.append([t, x])
-            gt_y_list.append([t, y])
-            gt_z_list.append([t, z])
-
-    time = [data[0] for data in gt_x_list]
-    gt_x = [data[1] for data in gt_x_list]
-    gt_y = [data[1] for data in gt_y_list]
-    gt_z = [data[1] for data in gt_z_list]
-
-    fig = plt.figure(figsize = (16,4))
-    plt.subplot(1,3,1)
-    plt.plot(time,gt_x, 'rx', markersize=5)
-    plt.subplot(1,3,2)
-    plt.plot(time,gt_y, 'rx', markersize=5)
-    plt.subplot(1,3,3)
-    plt.plot(time,gt_z, 'rx', markersize=5)
-
-
+    #for i, track in enumerate(tracks):
+    #    print("saved track:", i, "with lenght ", len(track))
+    if not os.path.exists(result_folder_path):
+        os.makedirs(result_folder_path)
     for track in tracks:
-        x_list = []
-        y_list = []
-        z_list = []
+        prediction_list = []
+        #print(len(track))
         for t in track:
-            x = t.state_vector[0]
-            y = t.state_vector[2]
-            z = t.state_vector[4]
-            x_list.append(x)
-            y_list.append(y)
-            z_list.append(z)
-        plt.subplot(1,3,1)
-        plt.plot(range(len(track)),x_list,'.')
-        plt.subplot(1,3,2)
-        plt.plot(range(len(track)),y_list,'.')
-        plt.subplot(1,3,3)
-        plt.plot(range(len(track)),z_list,'.')
+            prediction = {
+                    'timestamp': t.timestamp.timestamp(),
+                    'state_vector': np.array(t.state_vector).tolist(),
+                    'covar': np.array(t.covar).tolist()}
+            prediction_list.append(prediction)
+            xyz = np.array([t.state_vector[0], t.state_vector[2], t.state_vector[4]])
+            np.save(os.path.join(result_folder_path, str(t.timestamp.timestamp()) + '.npy'), xyz)
 
-    plt.suptitle(seq_folder)
-    plt.savefig(os.path.join(figure_folder, seq_folder+'.png'))
-    plt.close
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='LiDAR Tracking Processor')
+
+    # Required arguments
+    parser.add_argument('--dataset_folder', type=str, required=True,
+                        help='Path to dataset folder')
+    parser.add_argument('--result_folder', type=str, required=True,
+                        help='Path to result folder')
+    parser.add_argument('--sequence', type=str, default=None,
+                        help='Specific sequence to process (optional)')
+
+    # Tunable parameters
+    parser.add_argument('--eps', type=float, default=1.0,
+                        help='DBSCAN epsilon parameter (default: 1.0)')
+    parser.add_argument('--min_samples', type=int, default=1,
+                        help='DBSCAN minimum samples parameter (default: 1)')
+    parser.add_argument('--noise_covar', type=float, default=0.001,
+                        help='Measurement noise covariance (default: 0.001)')
+    parser.add_argument('--missed_distance', type=float, default=3.0,
+                        help='Missed distance threshold (default: 3.0)')
+    parser.add_argument('--covar_trace_thresh', type=float, default=30.0,
+                        help='Covariance trace threshold for deletion (default: 30.0)')
+    parser.add_argument('--min_points', type=int, default=1,
+                        help='Minimum points for track initiation (default: 1)')
+
+    args = parser.parse_args()
+
+
+    if args.sequence:
+        seq_folder_path = os.path.join(args.dataset_folder, args.sequence)
+        seq_result_path = os.path.join(args.result_folder, args.sequence)
+        if os.path.exists(seq_folder_path):
+            process_sequence(
+                seq_folder_path,
+                seq_result_path,
+                args.eps,
+                args.min_samples,
+                args.noise_covar,
+                args.missed_distance,
+                args.covar_trace_thresh,
+                args.min_points
+            )
+        else:
+            print(f"Sequence folder {seq_folder_path} does not exist")
+    else:
+        for seq_folder in os.listdir(args.dataset_folder):
+            seq_folder_path = os.path.join(args.dataset_folder, seq_folder)
+            seq_result_path = os.path.join(args.result_folder_path, seq_folder)
+            if os.path.isdir(seq_folder_path):
+                process_sequence(
+                    seq_folder_path,
+                    seq_result_path,
+                    args.eps,
+                    args.min_samples,
+                    args.noise_covar,
+                    args.missed_distance,
+                    args.covar_trace_thresh,
+                    args.min_points
+                )
