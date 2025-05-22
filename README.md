@@ -67,12 +67,14 @@ conda activate MMUAV
 ### Preprocess the  dataset by Yolov9
 
 Install Yolov9 Dependency
+```bash
 > pip install yolov9/requirements.txt
-
+```
 And download pretrained weight of Yolov9 under `./yolov9`.
 Then Prepare the dataset utilizing the zero-shot UAV detection by Yolov9
+```bash
 > python3 yolov9/detect.py --source $SOURCE --img 640 --device 0 --weights './yolov9-e.pt' --name $OUTPUT --num_kf 5 --kf_int 50 --save-crop
-
+```
 Replace `$SOURCE` and `$OUTPUT` to the source and desired output directories of the target trajectory. `num_kf` is the maximum number of keyframe selected from the trajectory. `kf_int` is the interval threshold between each keyframe to prevent selecting similar keyframes. `save-crop` will save the cropped image for detected drones, necessary for the training of efficientnet.
 
 
